@@ -36,6 +36,18 @@ API calls succeed — verified with a live process and `curl`.
   very useful), `db.db` (SQLite), `storage.json`, `log.db`, `vpn-proxy/`.
 - A single-instance guard is in effect: launching again just focuses the
   existing window.
+- **Login phones home.** Email/password login itself succeeds against the
+  *local* API (`/api/v2/auth/login` → `auth.login.ok` in `debug.log`), and
+  the app then moves to the profiles screen. Immediately after, the main
+  process validates the license against the **vendor backend**
+  (`https://app.gemlogin.vn/api/v2/checkLicense`) via IPC
+  (`window.electronAPI.checkLicense`). If that remote check does not
+  return `success: true`, the auth store calls `logout()` — so with no
+  internet/DNS route to `app.gemlogin.vn` the window will **flash the
+  dashboard for ~1 s and bounce back to the login page**. This is normal
+  app behavior, not a symptom of the port fix. The machine also needs
+  internet for `get_last_version`, browser-version downloads
+  (`hcm.s3storage.vn`) and the extension download.
 
 ## 2. Root causes, in detail
 
@@ -107,8 +119,13 @@ guarded by `process.env.GEMFIX`. It does four things:
    (1010 → **49009**; 1011 → 49010; general rule). This makes the app's
    own server start.
 2. **Rewrite main-process (Node) outbound HTTP** — `http.request/get`,
-   `https.request/get`, and global `fetch` — so anything the *Node* side
-   dials on a privileged port goes to the redirected port.
+   `https.request/get`, and global `fetch` — but **only** URLs that
+   explicitly target the app's own `localhost:1010`/`localhost:1011`
+   (string form and object form). Remote hosts (`app.gemlogin.vn`,
+   `hcm.s3storage.vn`, …) keep their native port — the hook **never**
+   adds a port for implicit 443/80. (An earlier draft of the hook did add
+   443→48442, which broke the app's license check and downloads — see §7
+   and §8. The fix is exact-match on the local host + explicit 1010/1011.)
 3. **Rewrite window loads** — `BrowserWindow.loadURL/loadFile` and each
    window's `webContents.loadURL` — from `http://localhost:1010/…` to
    `http://localhost:49009/…`.
@@ -204,6 +221,10 @@ Gotchas that cost time (already handled by the scripts, but know them):
 - The **vendor's NSIS installer** (run under `wine`; GUI or `/S` silent).
 - **Python 3** with two pip packages: `websocket-client` (CDP driver) and
   `Pillow` (icon resize): `pip install --user websocket-client Pillow`.
+- **Internet access** — the app phones home to `app.gemlogin.vn` (and
+  `hcm.s3storage.vn`) for the post-login license check, version check and
+  downloads; without it, login succeeds locally but the app auto-logs-out
+  after ~1 s (dashboard flashes, back to login — see §7).
 - Coreutils/`ss`/`curl` for the sanity checks.
 - A normal **unprivileged** account is fine (that's the whole point).
   If you *do* run as root / on a machine that allows privileged binds,
@@ -260,6 +281,7 @@ asset is covered — `fix_icon.py` globs **all** `gemlogo*.png` under
 | Window gray again after a reinstall | 3000px icon restored → `python3 ~/.local/share/gemlogin-fix/fix_icon.py`; also confirm the desktop entry still points at `launch.sh`. |
 | `EACCES` on *other* low ports in the app | Covered — the redirect is generic for **any** bind < 1024 (`48000 + p - 1`). |
 | App opens but the *login/API* misbehaves | Check `~/.gemlogin/debug.log`. The local API is on 49009 (`verify.sh`). Remote endpoints (`app.gemlogin.vn`) are untouched by the fix and need normal internet access. |
+| **Login works, dashboard flashes for ~1 s, then back to the login page** | This is the app's own behavior, not the port fix: after `auth.login.ok` the main process calls `https://app.gemlogin.vn/api/v2/checkLicense` (IPC `checkLicense`); anything other than `success:true` triggers the store's `else { logout() }`. Fix in this order: (1) make sure the *running* app uses the **current** `gemfix_patch.js` — an early build had a bug that rewrote remote 443→**48442**, producing exactly this symptom (look for `48442` in `/tmp/gemlogin_insp.log`); relaunch with the current scripts. (2) Check the route: `curl -s -m 10 -X POST https://app.gemlogin.vn/api/v2/checkLicense -H 'Content-Type: application/json' -d '{}'` should answer `401 {"message":"Token not provided"}` — a proper HTTP response proves TLS/DNS/IP egress are fine. (3) If the account truly is logged in elsewhere / the token is invalid, re-login or contact the vendor. |
 | `db.db` is 0 bytes / `SQLITE_ERROR: no such table: profiles` in debug.log | Known cosmetic symptom of a first boot on a fresh `~/.gemlogin`; the UI and local API still come up. If the login screen never appears, delete `~/.gemlogin/db.db` and relaunch. |
 | Port 49009 already taken | `launch.sh` picks the inspector port freely; if **49009** itself is occupied by something else, kill whatever holds it or change the `NEW`/`wp()` mapping consistently in `gemfix_patch.js` (it's one constant pair: `PRIV='http://localhost:1010'`, `NEW='http://localhost:49009'`). |
 
@@ -281,6 +303,15 @@ asset is covered — `fix_icon.py` globs **all** `gemlogo*.png` under
 - **`session.webRequest.onBeforeRequest` redirect** — fires but is not
   honored for these sub-resource requests in this Electron build; replaced
   by the in-page override (§3.4).
+- **The 443→48442 "rewrite"** — self-inflicted, then fixed: an early build of
+  the main-process HTTP hook rewrote *any* request lacking an explicit port
+  (i.e. every implicit-443/80 remote call — `app.gemlogin.vn`,
+  `hcm.s3storage.vn`) to the redirected port. The license check and all
+  downloads then went to a dead port → `AggregateError` /
+  `ECONNREFUSED :48442` → auto-logout. The shipped hook now only rewrites
+  **explicit** `localhost:1010/1011`; remote hosts keep their native port.
+  Symptom to watch for: `:48442` in `/tmp/gemlogin_insp.log` or
+  `debug.log` (`download.failed … :48442`) means an old patch is running.
 
 ## 9. Evidence trail (short version)
 
@@ -297,4 +328,14 @@ asset is covered — `fix_icon.py` globs **all** `gemlogo*.png` under
    no sudo, no caps) — a host policy, deterministic.
 7. Port is **hardcoded** in the compiled main bundle (no env/config knob).
 8. Redirect 1010→49009 + URL rewrites → `LISTEN OK :49009`, UI renders,
-   all images 200, API 200. Ship.
+   all images 200, API 200.
+9. **Login flash-logout** — after the UI fix, a correct login succeeded
+   locally (`auth.login.ok`, ~500 ms, `planLocal:true`) but the dashboard
+   bounced back to the login page in ~1 s. The app's own bundle shows the
+   gate: main process `checkLicense` → `https://app.gemlogin.vn/api/v2/checkLicense`
+   → on any non-`success` the store does `else { logout() }`. A live CDP
+   capture of the main process caught the real cause: the hook's HTTP
+   wrapper had rewritten the implicit-443 remote call to `:48442`
+   (`AggregateError`, `ECONNREFUSED 103.70.12.15:48442`). Fixed the hook to
+   match only explicit `localhost:1010/1011`; relaunch → login now **stays on
+   the dashboard**.

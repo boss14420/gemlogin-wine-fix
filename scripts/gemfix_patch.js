@@ -48,8 +48,15 @@
         try {
           if (typeof url === 'string') url = rw(url);
           else if (url && typeof url === 'object') {
-            const p = url.port ? parseInt(url.port, 10) : (url.protocol || 'http:').startsWith('https') ? 443 : 80;
-            if (isPriv(p)) url.port = String(wp(p));
+            // ONLY rewrite explicit localhost ports 1010/1011. Never add a
+            // port for implicit 443/80 — remote vendor calls (app.gemlogin.vn,
+            // hcm.s3storage.vn, …) must keep their native port or every
+            // license check / download breaks (ECONNREFUSED :48442).
+            const host = String(url.hostname || url.host || '');
+            if (/^(localhost|127\.0\.0\.1|\[?::1\]?)$/i.test(host) &&
+                (url.port === 1010 || url.port === '1010' || url.port === 1011 || url.port === '1011')) {
+              url.port = String(wp(parseInt(url.port, 10)));
+            }
           }
         } catch (e) {}
         if (typeof opts === 'function') { cb = opts; opts = null; }
