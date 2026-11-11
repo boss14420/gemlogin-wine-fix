@@ -8,12 +8,25 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 DEST="$HOME/.local/share/gemlogin-fix"
+
+# optional: install.sh --browser 150 152 | --browser all
+#  -> pre-download + extract those GemLogin browser builds after the fix
+BROWSER_TARGETS=()
+if [ $# -gt 0 ]; then
+  if [ "$1" != "--browser" ]; then
+    echo "install: usage: $0 [--browser VERSION ... | --browser all]"
+    exit 1
+  fi
+  shift
+  BROWSER_TARGETS=("$@")
+  [ ${#BROWSER_TARGETS[@]} -gt 0 ] || { echo "install: --browser needs at least one version"; exit 1; }
+fi
 mkdir -p "$DEST"
 
 # 1) install the scripts
 cp "$SRC"/scripts/gemfix_patch.js "$SRC"/scripts/inject.py \
    "$SRC"/scripts/launch.sh "$SRC"/scripts/fix_icon.py \
-   "$SRC"/scripts/verify.sh "$DEST"/
+   "$SRC"/scripts/verify.sh "$SRC"/scripts/prepare_browser.py "$DEST"/
 chmod +x "$DEST"/*.py "$DEST"/*.sh
 
 # 2) python deps
@@ -49,6 +62,16 @@ EOF
   echo "install: created $DESK"
 fi
 
+# 5) optional: pre-provision browser builds (the app's own downloader is
+#    size-blind and times out on the ~200 MB zips on slower links)
+if [ ${#BROWSER_TARGETS[@]} -gt 0 ]; then
+  echo "install: pre-downloading browser build(s): ${BROWSER_TARGETS[*]}"
+  python3 "$DEST/prepare_browser.py" "${BROWSER_TARGETS[@]}"
+fi
+
 echo "install: done."
 echo "install: launch GemLogin from the desktop icon, or run:"
 echo "  bash $DEST/launch.sh"
+echo "install: pre-fetch a browser build on demand (skips the app's"
+echo "install:        size-blind downloader):"
+echo "  python3 $DEST/prepare_browser.py <VERSION> [VERSION ... | all]"

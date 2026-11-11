@@ -108,6 +108,32 @@ splash/gray.
   which Electron always honors and which pauses at the app's
   `out/main/main.js` entry before any startup code runs.
 
+### 2.4 Browser-build download dies: "Request timed out" (vendor sizing bug)
+
+Opening a profile for the first time makes the main process download the
+profile's bundled Windows Chrome from the vendor S3 bucket
+(`https://app.gemlogin.vn/api/browser_versions` gives the exact per-version
+URL, e.g. `…/chrome_win/150.zip`, **~200 MB**), then extracts it to
+`~/.gemlogin/browser/<version>/` and spawns
+`<that>/Chrome-bin/chrome.exe`. The bundle's downloader is:
+
+```js
+const controller = new AbortController();
+const timeoutId = setTimeout(() => controller.abort(), timeout); // wall clock, from start
+const res = await fetch(url, { ...requestOptions, signal: controller.signal });
+...
+data = await res.arrayBuffer();   // whole body, then clearTimeout(timeoutId)
+```
+
+The abort covers the **entire** transfer and the timer value is tuned for
+small API/extension responses, not hundreds of MB. On a ~5.8 MB/s link the
+209 MB zip needs ~34 s, which exceeds the budget, so the app aborts its
+*own* in-flight request (`AbortError` → "Request timed out"). The network
+is not at fault — measured through the app's own `fetch`: 209,494,327
+bytes in 34.2 s, status 200. Fix: pre-provision the browser with
+`scripts/prepare_browser.py` (§6); once `browser/<version>/Chrome-bin/chrome.exe`
+exists the app skips its own download entirely.
+
 ## 3. The fix (how it works)
 
 `scripts/gemfix_patch.js` is evaluated at the `main.js` entry breakpoint
@@ -173,6 +199,7 @@ gemlogin-fix/
     ├── inject.py             ← CDP driver: breakpoint at out/main/main.js:0, eval patch, resume
     ├── gemfix_patch.js       ← the actual hook (bind redirect + URL rewrites)
     ├── fix_icon.py           ← idempotent 3000→256 icon downscaler (auto-finds install)
+    ├── prepare_browser.py    ← pre-download+extract GemLogin browser builds by version
     └── verify.sh             ← listener/API sanity check
 ```
 
@@ -243,6 +270,15 @@ Gotchas that cost time (already handled by the scripts, but know them):
    oversized icon (backs up originals as `*.orig`), and rewrites the
    desktop entry's `Exec=` to `bash ~/.local/share/gemlogin-fix/launch.sh`
    (original kept as `GemLogin.desktop.bak`).
+  2b. *(optional, recommended)* **Pre-fetch the browser builds** your
+    profiles will use, so the app never has to download them itself (§2.4):
+    ```bash
+    python3 ~/.local/share/gemlogin-fix/prepare_browser.py 141 150
+    ```
+    or bake it into step 2: `bash install.sh --browser 141 150`.
+    `python3 prepare_browser.py --list` prints every version the vendor
+    API offers; `all` grabs every Windows build. Safe to re-run —
+    already-present versions are skipped (`--force` re-downloads).
 3. **Launch** — click the desktop icon (or `bash ~/.local/share/gemlogin-fix/launch.sh`).
    Expected:
    ```
@@ -282,6 +318,7 @@ asset is covered — `fix_icon.py` globs **all** `gemlogo*.png` under
 | `EACCES` on *other* low ports in the app | Covered — the redirect is generic for **any** bind < 1024 (`48000 + p - 1`). |
 | App opens but the *login/API* misbehaves | Check `~/.gemlogin/debug.log`. The local API is on 49009 (`verify.sh`). Remote endpoints (`app.gemlogin.vn`) are untouched by the fix and need normal internet access. |
 | **Login works, dashboard flashes for ~1 s, then back to the login page** | This is the app's own behavior, not the port fix: after `auth.login.ok` the main process calls `https://app.gemlogin.vn/api/v2/checkLicense` (IPC `checkLicense`); anything other than `success:true` triggers the store's `else { logout() }`. Fix in this order: (1) make sure the *running* app uses the **current** `gemfix_patch.js` — an early build had a bug that rewrote remote 443→**48442**, producing exactly this symptom (look for `48442` in `/tmp/gemlogin_insp.log`); relaunch with the current scripts. (2) Check the route: `curl -s -m 10 -X POST https://app.gemlogin.vn/api/v2/checkLicense -H 'Content-Type: application/json' -d '{}'` should answer `401 {"message":"Token not provided"}` — a proper HTTP response proves TLS/DNS/IP egress are fine. (3) If the account truly is logged in elsewhere / the token is invalid, re-login or contact the vendor. |
+| **`Open profile failed: Browser N: Download of N.zip failed: Request timed out`** | Not a network problem (§8): the app's own downloader has a size-blind wall-clock abort, and the ~200 MB browser zip exceeds it on a slow link. Run `python3 ~/.local/share/gemlogin-fix/prepare_browser.py <N>` (downloads + extracts the exact vendor zip to `~/.gemlogin/browser/<N>/`); the app then skips its own download and opens the profile. The URL list comes from `https://app.gemlogin.vn/api/browser_versions`, the same API the app uses. |
 | `db.db` is 0 bytes / `SQLITE_ERROR: no such table: profiles` in debug.log | Known cosmetic symptom of a first boot on a fresh `~/.gemlogin`; the UI and local API still come up. If the login screen never appears, delete `~/.gemlogin/db.db` and relaunch. |
 | Port 49009 already taken | `launch.sh` picks the inspector port freely; if **49009** itself is occupied by something else, kill whatever holds it or change the `NEW`/`wp()` mapping consistently in `gemfix_patch.js` (it's one constant pair: `PRIV='http://localhost:1010'`, `NEW='http://localhost:49009'`). |
 
@@ -312,6 +349,11 @@ asset is covered — `fix_icon.py` globs **all** `gemlogo*.png` under
   **explicit** `localhost:1010/1011`; remote hosts keep their native port.
   Symptom to watch for: `:48442` in `/tmp/gemlogin_insp.log` or
   `debug.log` (`download.failed … :48442`) means an old patch is running.
+- **"The app can't fetch the internet"** — false. Measured through the
+   app's own `fetch` (CDP evaluate on the live main process): the full
+   209,494,327-byte `150.zip` came back in 34.2 s at 5.8 MB/s, status 200.
+   The "Request timed out" on profile open is the app's own abort timer
+   (§2.4), not reachability.
 
 ## 9. Evidence trail (short version)
 
@@ -339,3 +381,9 @@ asset is covered — `fix_icon.py` globs **all** `gemlogo*.png` under
    (`AggregateError`, `ECONNREFUSED 103.70.12.15:48442`). Fixed the hook to
    match only explicit `localhost:1010/1011`; relaunch → login now **stays on
    the dashboard**.
+10. **Profile open: "Download of 150.zip failed: Request timed out"** — app
+    fetch measured live through its own `fetch`: 209,494,327 bytes / 34.2 s /
+    status 200 ⇒ network fine, vendor abort timer too short (§2.4).
+    `prepare_browser.py 141 150` pre-provisioned `browser/<V>/Chrome-bin/`;
+    next open: **no** `download.failed` — straight to `launch.spawned` →
+    `launch.ok`.

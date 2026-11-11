@@ -75,6 +75,32 @@
           else if (input && typeof input === 'object' && 'url' in input && typeof input.url === 'string')
             input = Object.assign({}, input, { url: rw(input.url) });
         } catch (e) {}
+        // The app's download helper aborts its fetch after a short `timeout`;
+        // the browser builds (hundreds of MB from hcm.s3storage.vn) then die
+        // with "Request timed out" on a slow link. For those file-download
+        // URLs only, extend the effective abort to 30 minutes while still
+        // propagating the app's own (user-initiated) abort. API calls on
+        // app.gemlogin.vn are untouched.
+        try {
+          let uStr = '';
+          try { uStr = typeof input === 'string' ? input : ((input && input.url) || ''); } catch (e2) {}
+          if (uStr.indexOf('s3storage.vn') !== -1 && init && init.signal &&
+              typeof AbortController === 'function') {
+            const origSignal = init.signal;
+            const ac = new AbortController();
+            let timer = null;
+            if (origSignal.aborted) {
+              ac.abort();
+            } else {
+              timer = setTimeout(() => ac.abort(), 30 * 60 * 1000);
+              origSignal.addEventListener('abort', () => {
+                if (timer) clearTimeout(timer);
+                ac.abort();
+              }, { once: true });
+            }
+            init = Object.assign({}, init, { signal: ac.signal });
+          }
+        } catch (e) {}
         return of.call(this, input, init);
       };
     }
